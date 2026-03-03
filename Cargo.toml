@@ -1,0 +1,12 @@
+[package]
+name = "p2p_energy_auction"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# We use 'digest' feature to enable hashing to points
+curve25519-dalek = { version = "4.1", features = ["rand_core", "digest"] }
+rand = "0.8"
+sha2 = "0.10"
+# This fixes the 'hex' error
+hex = "0.4"
