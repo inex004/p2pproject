@@ -10,3 +10,8 @@ rand = "0.8"
 sha2 = "0.10"
 # This fixes the 'hex' error
 hex = "0.4"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+libp2p = { version = "0.56.0", features = ["tokio", "gossipsub", "mdns", "noise", "yamux", "tcp", "macros"] }
+tokio = { version = "1.50.0", features = ["full"] }
+futures = "0.3.32"
