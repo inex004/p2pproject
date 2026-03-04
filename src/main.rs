@@ -5,20 +5,24 @@ use rand::thread_rng;
 use sha2::{Sha512, Digest};
 use serde::{Serialize, Deserialize};
 use std::collections::HashMap;
+use std::time::{SystemTime, UNIX_EPOCH, Duration};
 
 // Networking imports
 use libp2p::{gossipsub, mdns, noise, swarm::{NetworkBehaviour, SwarmEvent}, tcp, yamux};
 use std::error::Error;
-use std::time::Duration;
 use tokio::{io, io::AsyncBufReadExt, select};
 use futures::StreamExt; 
 
-// --- PHASE 1 & 2: MATH & DATA STRUCTURES ---
+// --- SECURITY CONSTANTS ---
+const CURRENT_AUCTION_ID: &str = "ENERGY_AUCTION_001"; 
+const MAX_MESSAGE_AGE_SECS: u64 = 60; 
+
+// --- MATH & DATA STRUCTURES ---
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum NetworkMessage {
-    Commit { bidder_id: String, commitment: String },
-    Reveal { bidder_id: String, bid: u64, blind_hex: String },
+    Commit { auction_id: String, timestamp: u64, bidder_id: String, commitment: String },
+    Reveal { auction_id: String, timestamp: u64, bidder_id: String, bid: u64, blind_hex: String },
 }
 
 fn get_h_basepoint() -> RistrettoPoint {
@@ -36,7 +40,7 @@ fn commit(bid_value: u64, blinding_factor: Scalar) -> RistrettoPoint {
     (*g * &v) + (blinding_factor * h)
 }
 
-// --- PHASE 3 & 4: NETWORKING & AUCTION STATE ---
+// --- NETWORKING & AUCTION STATE ---
 
 #[derive(NetworkBehaviour)]
 struct AuctionNetworkBehaviour {
@@ -46,15 +50,18 @@ struct AuctionNetworkBehaviour {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    println!("--- Starting Decentralized Energy Node (Phase 4) ---");
+    println!("--- Starting Secure Decentralized Energy Node ---");
+    println!("🛡️ Active Defenses: Ed25519 Signatures, Replay Protection, Spam Mitigation");
 
     let id_keys = libp2p::identity::Keypair::generate_ed25519();
     let local_peer_id = id_keys.public().to_peer_id();
     println!("My Peer ID: {}", local_peer_id);
 
+    // --- SECURITY UPGRADE: NETWORK SPAM LIMITS ---
     let gossipsub_config = gossipsub::ConfigBuilder::default()
         .heartbeat_interval(Duration::from_secs(1))
         .validation_mode(gossipsub::ValidationMode::Strict)
+        .max_transmit_size(2048) // DEFENSE 1: Drop any payload larger than 2KB!
         .build()
         .expect("Valid gossipsub config");
 
@@ -88,6 +95,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut stdin = io::BufReader::new(io::stdin()).lines();
 
     let mut received_commitments: HashMap<String, String> = HashMap::new();
+    // NEW LEDGER: We need to track who already successfully revealed to stop Crypto-Spam
+    let mut verified_bids: HashMap<String, u64> = HashMap::new(); 
+    
     let mut my_secret_bid: Option<u64> = None;
     let mut my_secret_blind: Option<Scalar> = None;
 
@@ -110,7 +120,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             let my_commitment = commit(bid_amount, r);
                             let commitment_hex = hex::encode(my_commitment.compress().as_bytes());
                             
+                            let current_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+                            
                             let msg = NetworkMessage::Commit {
+                                auction_id: CURRENT_AUCTION_ID.to_string(),
+                                timestamp: current_time,
                                 bidder_id: local_peer_id.to_string(),
                                 commitment: commitment_hex.clone(),
                             };
@@ -126,7 +140,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 } else if line_str == "REVEAL" {
                     if let (Some(bid), Some(blind)) = (my_secret_bid, my_secret_blind) {
                         let blind_hex = hex::encode(blind.as_bytes());
+                        let current_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+
                         let msg = NetworkMessage::Reveal {
+                            auction_id: CURRENT_AUCTION_ID.to_string(),
+                            timestamp: current_time,
                             bidder_id: local_peer_id.to_string(),
                             bid,
                             blind_hex,
@@ -169,40 +187,66 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 },
                 
                 SwarmEvent::Behaviour(AuctionNetworkBehaviourEvent::Gossipsub(gossipsub::Event::Message {
-                    propagation_source: _peer_id, // FIXED WARNING
+                    propagation_source: _peer_id,
                     message,
                     ..
                 })) => {
                     let json_str = String::from_utf8_lossy(&message.data);
                     
                     if let Ok(parsed_msg) = serde_json::from_str::<NetworkMessage>(&json_str) {
+                        let current_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+
                         match parsed_msg {
-                            NetworkMessage::Commit { bidder_id, commitment } => {
-                                println!("📥 Received Locked Bid from {}", bidder_id);
-                                received_commitments.insert(bidder_id, commitment);
+                            NetworkMessage::Commit { auction_id, timestamp, bidder_id, commitment } => {
+                                // Replay Checks
+                                if auction_id != CURRENT_AUCTION_ID || current_time > timestamp + MAX_MESSAGE_AGE_SECS {
+                                    println!("    🛡️ REPLAY BLOCKED: Ignored invalid/expired Commit.");
+                                } 
+                                // --- DEFENSE 2: MEMORY EXHAUSTION (One-Bid Rule) ---
+                                else if received_commitments.contains_key(&bidder_id) {
+                                    println!("    🛡️ SPAM BLOCKED: Peer {} already submitted a bid. Dropping duplicate.", bidder_id);
+                                } 
+                                // Safe to save!
+                                else {
+                                    println!("📥 Received Valid Locked Bid from {}", bidder_id);
+                                    received_commitments.insert(bidder_id, commitment);
+                                }
                             },
-                            NetworkMessage::Reveal { bidder_id, bid, blind_hex } => {
-                                println!("🔓 Peer {} is revealing their bid as: {} credits!", bidder_id, bid);
-                                
-                                if let Some(stored_hex) = received_commitments.get(&bidder_id) {
-                                    if hex::decode(stored_hex).is_ok() { // FIXED WARNING
-                                        if let Ok(blind_bytes) = hex::decode(&blind_hex) {
-                                            let mut r_bytes = [0u8; 32];
-                                            r_bytes.copy_from_slice(&blind_bytes);
-                                            let revealed_r = Scalar::from_bytes_mod_order(r_bytes);
-                                            
-                                            let re_calculated_point = commit(bid, revealed_r);
-                                            let re_calculated_hex = hex::encode(re_calculated_point.compress().as_bytes());
-                                            
-                                            if &re_calculated_hex == stored_hex {
-                                                println!("    ✅ VERIFICATION PASSED: The bid is mathematically valid and wasn't tampered with!");
-                                            } else {
-                                                println!("    ❌ VERIFICATION FAILED: Cheating detected! Hashes do not match.");
+                            NetworkMessage::Reveal { auction_id, timestamp, bidder_id, bid, blind_hex } => {
+                                // Replay Checks
+                                if auction_id != CURRENT_AUCTION_ID || current_time > timestamp + MAX_MESSAGE_AGE_SECS {
+                                    println!("    🛡️ REPLAY BLOCKED: Ignored invalid/expired Reveal.");
+                                } 
+                                // --- DEFENSE 3: CPU EXHAUSTION (Crypto-Math Spam) ---
+                                else if verified_bids.contains_key(&bidder_id) {
+                                    println!("    🛡️ SPAM BLOCKED: Peer {} already successfully revealed. Skipping expensive verification.", bidder_id);
+                                } 
+                                else {
+                                    println!("🔓 Peer {} is revealing their bid as: {} credits!", bidder_id, bid);
+                                    
+                                    if let Some(stored_hex) = received_commitments.get(&bidder_id) {
+                                        if hex::decode(stored_hex).is_ok() { 
+                                            if let Ok(blind_bytes) = hex::decode(&blind_hex) {
+                                                let mut r_bytes = [0u8; 32];
+                                                r_bytes.copy_from_slice(&blind_bytes);
+                                                let revealed_r = Scalar::from_bytes_mod_order(r_bytes);
+                                                
+                                                // The expensive math calculation!
+                                                let re_calculated_point = commit(bid, revealed_r);
+                                                let re_calculated_hex = hex::encode(re_calculated_point.compress().as_bytes());
+                                                
+                                                if &re_calculated_hex == stored_hex {
+                                                    println!("    ✅ VERIFICATION PASSED: Cryptography verified!");
+                                                    // Add to the verified ledger so they can't spam this math again!
+                                                    verified_bids.insert(bidder_id, bid);
+                                                } else {
+                                                    println!("    ❌ VERIFICATION FAILED: Cheating detected!");
+                                                }
                                             }
                                         }
+                                    } else {
+                                        println!("    ⚠️ Ignored: They tried to reveal a bid, but we never received their commitment!");
                                     }
-                                } else {
-                                    println!("    ⚠️ Ignored: They tried to reveal a bid, but we never received their commitment!");
                                 }
                             }
                         }
