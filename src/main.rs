@@ -13,10 +13,10 @@ use std::env;
 
 const CURRENT_AUCTION_ID: &str = "ENERGY_AUCTION_001"; 
 
-// --- NEW: CLOCK DRIFT TRIPWIRE ---
-// The maximum allowed "ticks" a node can be ahead of us.
+// --- CLOCK DRIFT TRIPWIRE ---
 const MAX_CLOCK_DRIFT: u64 = 100;
 
+// --- THE UTILITY WHITELIST (PKI / Sybil Defense) ---
 const AUTHORIZED_METERS: [&str; 4] = [
     "12D3KooWP12edPP1guWsgxgmr74Lt1aE7JwFksyCiew9Srr8RjwB", // Node A
     "12D3KooWFuoRX7BQ9PJHUxzvJjzuJFx11TYPWX6A3pRWqUHxZZeg", // Node B
@@ -156,6 +156,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
                 },
 
+                // --- NEW: LOG WHEN THE HAMMER DROPS ---
+                SwarmEvent::ConnectionClosed { peer_id, .. } => {
+                    println!("🔌 TCP CONNECTION SEVERED with peer: {}", peer_id);
+                },
+
                 SwarmEvent::Behaviour(network::AuctionNetworkBehaviourEvent::Identify(event)) => {
                     if let libp2p::identify::Event::Received { peer_id, info, .. } = event {
                         for addr in info.listen_addrs {
@@ -183,12 +188,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
                         // LAYER 1: The PKI / Sybil Firewall
                         if !AUTHORIZED_METERS.contains(&incoming_peer_id.as_str()) {
-                            println!("🚨 SYBIL ALERT: Unauthorized peer {} blocked! Docking reputation...", incoming_peer_id);
-                            let _ = swarm.behaviour_mut().gossipsub.report_message_validation_result(
-                                &message_id, 
-                                &propagation_source, 
-                                libp2p::gossipsub::MessageAcceptance::Reject
-                            );
+                            println!("🚨 SYBIL ALERT: Unauthorized peer {} blocked!", incoming_peer_id);
+                            let _ = swarm.behaviour_mut().gossipsub.report_message_validation_result(&message_id, &propagation_source, libp2p::gossipsub::MessageAcceptance::Reject);
+                            
+                            // 🔨 PHYSICAL BAN HAMMER: Disconnect TCP socket instantly
+                            if let Ok(peer) = incoming_peer_id.parse::<libp2p::PeerId>() {
+                                println!("🔨 DROPPING HAMMER: Forcing disconnect on Hacker IP!");
+                                let _ = swarm.disconnect_peer_id(peer);
+                            }
                             continue; 
                         }
 
@@ -197,17 +204,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             network::NetworkMessage::Reveal { lamport_clock, .. } => *lamport_clock,
                         };
 
-                        // --- LAYER 2: THE LAMPORT OVERFLOW FIREWALL ---
-                        // We use `saturating_add` so if the hacker sends the max possible u64, 
-                        // Rust doesn't panic during the addition check itself!
+                        // LAYER 2: THE LAMPORT OVERFLOW FIREWALL
                         if incoming_clock > state.lamport_clock.saturating_add(MAX_CLOCK_DRIFT) {
-                            println!("🚨 TIME-JACKING ALERT: Peer {} attempted a Fast-Forward Attack! (Incoming Clock: {}) Docking reputation...", incoming_peer_id, incoming_clock);
-                            let _ = swarm.behaviour_mut().gossipsub.report_message_validation_result(
-                                &message_id, 
-                                &propagation_source, 
-                                libp2p::gossipsub::MessageAcceptance::Reject
-                            );
-                            continue; // Drop the packet, don't sync the clock!
+                            println!("🚨 TIME-JACKING ALERT: Peer {} attempted Fast-Forward Attack!", incoming_peer_id);
+                            let _ = swarm.behaviour_mut().gossipsub.report_message_validation_result(&message_id, &propagation_source, libp2p::gossipsub::MessageAcceptance::Reject);
+                            
+                            // 🔨 PHYSICAL BAN HAMMER: Disconnect TCP socket instantly
+                            if let Ok(peer) = incoming_peer_id.parse::<libp2p::PeerId>() {
+                                println!("🔨 DROPPING HAMMER: Forcing disconnect on Rogue Node!");
+                                let _ = swarm.disconnect_peer_id(peer);
+                            }
+                            continue;
                         }
 
                         // If it passed both firewalls, it's safe to sync!
