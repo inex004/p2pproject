@@ -13,6 +13,10 @@ use std::env;
 
 const CURRENT_AUCTION_ID: &str = "ENERGY_AUCTION_001"; 
 
+// --- NEW: CLOCK DRIFT TRIPWIRE ---
+// The maximum allowed "ticks" a node can be ahead of us.
+const MAX_CLOCK_DRIFT: u64 = 100;
+
 const AUTHORIZED_METERS: [&str; 4] = [
     "12D3KooWP12edPP1guWsgxgmr74Lt1aE7JwFksyCiew9Srr8RjwB", // Node A
     "12D3KooWFuoRX7BQ9PJHUxzvJjzuJFx11TYPWX6A3pRWqUHxZZeg", // Node B
@@ -49,7 +53,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let listen_addr: libp2p::Multiaddr = format!("/ip4/127.0.0.1/tcp/{}", listen_port).parse()?;
     swarm.listen_on(listen_addr.clone())?;
     
-    // Elevate the node to act as a public Kademlia phonebook server
     swarm.behaviour_mut().kademlia.set_mode(Some(libp2p::kad::Mode::Server));
     println!("📡 Listening for neighbors on: {}", listen_addr);
 
@@ -170,7 +173,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     println!("✅ Neighbor {} subscribed to the auction topic!", peer_id);
                 },
                 
-                // --- ARMED FIREWALL: CATCH AND PUNISH ---
                 SwarmEvent::Behaviour(network::AuctionNetworkBehaviourEvent::Gossipsub(libp2p::gossipsub::Event::Message { message, propagation_source, message_id })) => {
                     if let Ok(parsed_msg) = serde_json::from_str::<network::NetworkMessage>(&String::from_utf8_lossy(&message.data)) {
                         
@@ -179,10 +181,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             network::NetworkMessage::Reveal { bidder_id, .. } => bidder_id,
                         };
 
+                        // LAYER 1: The PKI / Sybil Firewall
                         if !AUTHORIZED_METERS.contains(&incoming_peer_id.as_str()) {
-                            println!("🚨 SECURITY ALERT: Unauthorized peer {} blocked! Docking reputation score...", incoming_peer_id);
-                            
-                            // PULL THE TRIGGER: Tell Gossipsub to reject the message and penalize the sender
+                            println!("🚨 SYBIL ALERT: Unauthorized peer {} blocked! Docking reputation...", incoming_peer_id);
                             let _ = swarm.behaviour_mut().gossipsub.report_message_validation_result(
                                 &message_id, 
                                 &propagation_source, 
@@ -195,6 +196,21 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             network::NetworkMessage::Commit { lamport_clock, .. } => *lamport_clock,
                             network::NetworkMessage::Reveal { lamport_clock, .. } => *lamport_clock,
                         };
+
+                        // --- LAYER 2: THE LAMPORT OVERFLOW FIREWALL ---
+                        // We use `saturating_add` so if the hacker sends the max possible u64, 
+                        // Rust doesn't panic during the addition check itself!
+                        if incoming_clock > state.lamport_clock.saturating_add(MAX_CLOCK_DRIFT) {
+                            println!("🚨 TIME-JACKING ALERT: Peer {} attempted a Fast-Forward Attack! (Incoming Clock: {}) Docking reputation...", incoming_peer_id, incoming_clock);
+                            let _ = swarm.behaviour_mut().gossipsub.report_message_validation_result(
+                                &message_id, 
+                                &propagation_source, 
+                                libp2p::gossipsub::MessageAcceptance::Reject
+                            );
+                            continue; // Drop the packet, don't sync the clock!
+                        }
+
+                        // If it passed both firewalls, it's safe to sync!
                         state.sync_clock(incoming_clock);
 
                         match parsed_msg {
