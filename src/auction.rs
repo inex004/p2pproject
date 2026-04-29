@@ -1,38 +1,34 @@
 use std::collections::HashMap;
 use curve25519_dalek::scalar::Scalar;
-use std::cmp;
+use std::time::{SystemTime, UNIX_EPOCH}; 
 
 const RESERVE_PRICE: u64 = 100; 
 
 pub struct AuctionState {
-    pub lamport_clock: u64, // NEW: The Lamport Logical Clock
-    pub received_commitments: HashMap<String, String>,
+    // 🔥 REMOVED: lamport_clock
+    // The u64 here will now store the physical timestamp (ms)
+    pub received_commitments: HashMap<String, (String, u64)>, 
     pub verified_bids: HashMap<String, u64>,
     pub my_secret_bid: Option<u64>,
     pub my_secret_blind: Option<Scalar>,
+    pub commit_deadline: u64, 
 }
 
 impl AuctionState {
     pub fn new() -> Self {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let deadline = now + 300; // 5 minute deadline
+        
         Self {
-            lamport_clock: 0, 
             received_commitments: HashMap::new(),
             verified_bids: HashMap::new(),
             my_secret_bid: None,
             my_secret_blind: None,
+            commit_deadline: deadline, 
         }
     }
 
-    // Call this right before sending a message
-    pub fn tick(&mut self) -> u64 {
-        self.lamport_clock += 1;
-        self.lamport_clock
-    }
-
-    // Call this the exact moment a message arrives from the network
-    pub fn sync_clock(&mut self, received_clock: u64) {
-        self.lamport_clock = cmp::max(self.lamport_clock, received_clock) + 1;
-    }
+    // 🔥 REMOVED: tick() and sync_clock() functions. They are no longer needed!
 
     pub fn resolve(&mut self) {
         if self.verified_bids.is_empty() {
@@ -40,8 +36,23 @@ impl AuctionState {
             return;
         }
 
-        let mut sorted_bids: Vec<(&String, &u64)> = self.verified_bids.iter().collect();
-        sorted_bids.sort_by(|a, b| b.1.cmp(a.1));
+        // 🔥 FIX: We now extract the PeerID, Bid Amount, AND the Commitment Hex
+        let mut sorted_bids: Vec<(&String, &u64, String)> = self.verified_bids.iter().map(|(peer_id, bid)| {
+            let commit_hex = self.received_commitments.get(peer_id).unwrap().0.clone();
+            (peer_id, bid, commit_hex)
+        }).collect();
+
+        // 🔥 FIX: The Cryptographic Lottery Tie-Breaker
+        sorted_bids.sort_by(|a, b| {
+            match b.1.cmp(a.1) { // Primary Sort: Bid Amount (Highest wins)
+                std::cmp::Ordering::Equal => {
+                    // Secondary Sort (Tie-Breaker): Compare the random commitment strings
+                    // This is perfectly fair, unpredictable to the user, and 100% deterministic across the network!
+                    b.2.cmp(&a.2) 
+                },
+                other => other,
+            }
+        });
 
         let winner_id = sorted_bids[0].0;
         let winning_bid = *sorted_bids[0].1;
@@ -50,10 +61,12 @@ impl AuctionState {
             println!("\n❌ AUCTION FAILED ❌");
             println!("The highest bid ({} credits) did not meet the Reserve Price of {}.", winning_bid, RESERVE_PRICE);
         } else {
+            // Note on Vickrey Ties: If Alice and Bob both bid 150, the winner pays the second-highest bid.
+            // In a tie, the second-highest bid is ALSO 150. So the winner pays 150. This is economically correct!
             let mut clearing_price = if sorted_bids.len() > 1 { 
                 *sorted_bids[1].1 
             } else { 
-                winning_bid 
+                RESERVE_PRICE 
             };
 
             if clearing_price < RESERVE_PRICE {
@@ -70,6 +83,8 @@ impl AuctionState {
             
             if winning_bid > clearing_price {
                 println!("✨ The winner saved {} credits due to Vickrey rules!", winning_bid - clearing_price);
+            } else {
+                println!("⚖️ Flat clearing price applied (Tie or Reserve).");
             }
             println!("==================================================\n");
         }
@@ -79,8 +94,6 @@ impl AuctionState {
         self.my_secret_bid = None;
         self.my_secret_blind = None;
         
-        // We tick the clock one more time to mark the end of the auction event
-        self.tick(); 
-        println!("🧹 Memory wiped. Lamport Clock currently at: {}\n", self.lamport_clock);
+        println!("🧹 Memory wiped. State machine reset.\n");
     }
 }

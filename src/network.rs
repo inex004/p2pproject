@@ -2,7 +2,7 @@
 use libp2p::{gossipsub, noise, swarm::NetworkBehaviour, tcp, yamux, Swarm, SwarmBuilder};
 use libp2p::identity::Keypair;
 use libp2p::kad::{self, store::MemoryStore}; 
-use libp2p::identify; // NEW: The Identify Protocol
+use libp2p::identify; 
 use serde::{Serialize, Deserialize};
 use std::time::Duration;
 use std::error::Error;
@@ -10,15 +10,16 @@ use libp2p::gossipsub::{PeerScoreParams, PeerScoreThresholds};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum NetworkMessage {
-    Commit { auction_id: String, lamport_clock: u64, bidder_id: String, commitment: String },
-    Reveal { auction_id: String, lamport_clock: u64, bidder_id: String, bid: u64, blind_hex: String },
+    // 🔥 CHANGED: lamport_clock is now timestamp
+    Commit { auction_id: String, timestamp: u64, bidder_id: String, commitment: String },
+    Reveal { auction_id: String, timestamp: u64, bidder_id: String, bid: u64, blind_hex: String },
 }
 
 #[derive(NetworkBehaviour)]
 pub struct AuctionNetworkBehaviour {
     pub gossipsub: gossipsub::Behaviour,
     pub kademlia: kad::Behaviour<MemoryStore>,
-    pub identify: identify::Behaviour, // NEW: Added to the behavior stack
+    pub identify: identify::Behaviour, 
 }
 
 pub fn setup_swarm(id_keys: Keypair, local_peer_id: libp2p::PeerId) -> Result<Swarm<AuctionNetworkBehaviour>, Box<dyn Error>> {
@@ -59,12 +60,11 @@ pub fn setup_swarm(id_keys: Keypair, local_peer_id: libp2p::PeerId) -> Result<Sw
     let kademlia_behaviour = kad::Behaviour::with_config(local_peer_id, store, kad_config);
 
     // --- 3. IDENTIFY PROTOCOL (NAT/Port Discovery) ---
-    // This automatically broadcasts our true listening port to anyone who connects
     let identify_config = identify::Config::new(
         "/energy-auction/id/1.0.0".to_string(),
         id_keys.public(),
     )
-    .with_push_listen_addr_updates(true); // Tell neighbors if our port changes
+    .with_push_listen_addr_updates(true); 
     let identify_behaviour = identify::Behaviour::new(identify_config);
 
     // --- 4. COMBINE BEHAVIOURS ---
