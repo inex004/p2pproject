@@ -1,6 +1,6 @@
 use libp2p::{gossipsub, noise, swarm::{NetworkBehaviour, SwarmEvent}, tcp, yamux, SwarmBuilder};
 use libp2p::identity::Keypair;
-use std::time::{Duration, SystemTime, UNIX_EPOCH}; // 🔥 Added Time imports
+use std::time::Duration;
 use std::error::Error;
 use tokio::time;
 use futures::StreamExt; 
@@ -10,11 +10,11 @@ pub struct EvilBehaviour {
     pub gossipsub: gossipsub::Behaviour,
 }
 
+// 🔥 CLEANED: Removed the timestamp_payload parameter
 async fn launch_hacker_bot(
     bot_name: String,
     id_keys: Keypair,
     target_addr: libp2p::Multiaddr,
-    timestamp_payload: u64, // 🔥 Changed from clock_payload
 ) {
     let local_peer_id = id_keys.public().to_peer_id();
     println!("🤖 [{}] Booting up. Peer ID: {}", bot_name, local_peer_id);
@@ -52,10 +52,9 @@ async fn launch_hacker_bot(
     loop {
         tokio::select! {
             _ = spam_interval.tick() => {
-                // 🔥 Updated JSON to send 'timestamp' instead of 'lamport_clock'
                 let fake_json = format!(
-                    r#"{{"Commit":{{"auction_id":"ENERGY_AUCTION_001","timestamp":{},"bidder_id":"{}","commitment":"fake_hex"}}}}"#, 
-                    timestamp_payload, local_peer_id
+                    r#"{{"Commit":{{"auction_id":"ENERGY_AUCTION_001","bidder_id":"{}","binding_hash":"fake_hash_123"}}}}"#, 
+                    local_peer_id
                 );
                 let _ = swarm.behaviour_mut().gossipsub.publish(topic.clone(), fake_json.as_bytes());
             }
@@ -74,7 +73,7 @@ async fn launch_hacker_bot(
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     println!("==================================================");
-    println!("  👿 BOOTING COORDINATED MULTI-VECTOR ATTACK 👿");
+    println!("  👿 BOOTING SYBIL/DoS ATTACK BOT 👿");
     println!("==================================================");
 
     let target_addr: libp2p::Multiaddr = "/ip4/127.0.0.1/tcp/8001".parse()?;
@@ -83,14 +82,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let random_keys = Keypair::generate_ed25519();
     let target_clone_1 = target_addr.clone();
     
-    // Send a normal, valid physical timestamp so it only triggers the Sybil trap
-    let normal_timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
-    
     let bot1 = tokio::spawn(async move {
-        launch_hacker_bot("SYBIL_BOT".to_string(), random_keys, target_clone_1, normal_timestamp).await;
+        // 🔥 CLEANED: Removed the timestamp argument
+        launch_hacker_bot("SYBIL_BOT".to_string(), random_keys, target_clone_1).await;
     });
 
-    // --- BOT 2: THE INSIDER (Time-Jacking Attack) ---
+    // --- BOT 2: THE INSIDER (Fake Hash Attack) ---
     let key_file = "meter_8002.key";
     let stolen_keys = if let Ok(bytes) = std::fs::read(&key_file) {
         Keypair::from_protobuf_encoding(&bytes).unwrap()
@@ -100,11 +97,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     };
     let target_clone_2 = target_addr.clone();
 
-    // 🔥 Send a timestamp 10 seconds into the future to trigger the Bounded Acceptance Window trap!
-    let time_jack_timestamp = normal_timestamp + 10_000; 
-
     let bot2 = tokio::spawn(async move {
-        launch_hacker_bot("TIME_JACKER_BOT".to_string(), stolen_keys, target_clone_2, time_jack_timestamp).await;
+        // 🔥 CLEANED: Removed the timestamp argument
+        launch_hacker_bot("BAD_HASH_BOT".to_string(), stolen_keys, target_clone_2).await;
     });
 
     let _ = tokio::join!(bot1, bot2);

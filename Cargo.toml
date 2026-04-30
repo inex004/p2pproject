@@ -17,10 +17,6 @@ path = "src/main.rs"
 name = "evil_node"
 path = "src/bin/evil_node.rs" # FIX: Added /bin/
 
-# 3. The New Homomorphic Math Sniper
-[[bin]]
-name = "malleability_attack"
-path = "src/bin/malleability_attack.rs" # FIX: Added /bin/
 
 
 [dependencies]

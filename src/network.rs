@@ -1,4 +1,3 @@
-// --- NETWORKING MODULE (ECLIPSE, SYBIL, KADEMLIA, & IDENTIFY SECURED) ---
 use libp2p::{gossipsub, noise, swarm::NetworkBehaviour, tcp, yamux, Swarm, SwarmBuilder};
 use libp2p::identity::Keypair;
 use libp2p::kad::{self, store::MemoryStore}; 
@@ -10,9 +9,12 @@ use libp2p::gossipsub::{PeerScoreParams, PeerScoreThresholds};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum NetworkMessage {
-    // 🔥 CHANGED: lamport_clock is now timestamp
-    Commit { auction_id: String, timestamp: u64, bidder_id: String, commitment: String },
-    Reveal { auction_id: String, timestamp: u64, bidder_id: String, bid: u64, blind_hex: String },
+    // 🔥 NEW: Added reserve_price to the broadcast
+    AnnounceAuction { auction_id: String, seller_id: String, energy_amount: u64, reserve_price: u64 },
+    Commit { auction_id: String, bidder_id: String, binding_hash: String },
+    Reveal { auction_id: String, bidder_id: String, bid: u64, blind_hex: String },
+    Heartbeat { auction_id: String, seller_id: String },
+    DeliveryComplete { auction_id: String, seller_id: String }, 
 }
 
 #[derive(NetworkBehaviour)]
