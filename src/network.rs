@@ -7,14 +7,20 @@ use std::time::Duration;
 use std::error::Error;
 use libp2p::gossipsub::{PeerScoreParams, PeerScoreThresholds};
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Debug, Serialize, Deserialize)]
 pub enum NetworkMessage {
-    // 🔥 NEW: Added reserve_price to the broadcast
     AnnounceAuction { auction_id: String, seller_id: String, energy_amount: u64, reserve_price: u64 },
     Commit { auction_id: String, bidder_id: String, binding_hash: String },
     Reveal { auction_id: String, bidder_id: String, bid: u64, blind_hex: String },
     Heartbeat { auction_id: String, seller_id: String },
-    DeliveryComplete { auction_id: String, seller_id: String }, 
+    DeliveryComplete { auction_id: String, seller_id: String },
+    
+    // 🔥 NEW: Delegated Proof of Stake Packets
+    IntentToValidate { auction_id: String, validator_id: String },
+    Verdict { 
+        auction_id: String, validator_id: String, 
+        winner_id: Option<String>, clearing_price: u64, slash_list: Vec<String> 
+    },
 }
 
 #[derive(NetworkBehaviour)]
