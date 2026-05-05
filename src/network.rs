@@ -1,92 +1,96 @@
-use libp2p::{gossipsub, noise, swarm::NetworkBehaviour, tcp, yamux, Swarm, SwarmBuilder};
-use libp2p::identity::Keypair;
-use libp2p::kad::{self, store::MemoryStore}; 
-use libp2p::identify; 
-use serde::{Serialize, Deserialize};
+use libp2p::{
+    gossipsub, identify, identity, noise, tcp, yamux, relay, autonat, dcutr, ping,
+    swarm::NetworkBehaviour,
+    PeerId, SwarmBuilder, Transport,
+};
+use libp2p::core::upgrade;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::time::Duration;
-use std::error::Error;
-use libp2p::gossipsub::{PeerScoreParams, PeerScoreThresholds};
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum NetworkMessage {
     AnnounceAuction { auction_id: String, seller_id: String, energy_amount: u64, reserve_price: u64 },
+    IntentToValidate { auction_id: String, validator_id: String },
+    Verdict { auction_id: String, validator_id: String, winner_id: Option<String>, clearing_price: u64, slash_list: Vec<String> },
     Commit { auction_id: String, bidder_id: String, binding_hash: String },
     Reveal { auction_id: String, bidder_id: String, bid: u64, blind_hex: String },
     Heartbeat { auction_id: String, seller_id: String },
     DeliveryComplete { auction_id: String, seller_id: String },
-    
-    // 🔥 NEW: Delegated Proof of Stake Packets
-    IntentToValidate { auction_id: String, validator_id: String },
-    Verdict { 
-        auction_id: String, validator_id: String, 
-        winner_id: Option<String>, clearing_price: u64, slash_list: Vec<String> 
-    },
 }
 
 #[derive(NetworkBehaviour)]
 pub struct AuctionNetworkBehaviour {
     pub gossipsub: gossipsub::Behaviour,
-    pub kademlia: kad::Behaviour<MemoryStore>,
-    pub identify: identify::Behaviour, 
+    pub identify: identify::Behaviour,
+    pub relay_client: relay::client::Behaviour,
+    pub dcutr: dcutr::Behaviour,
+    pub autonat: autonat::Behaviour,
+    pub ping: ping::Behaviour,
 }
 
-pub fn setup_swarm(id_keys: Keypair, local_peer_id: libp2p::PeerId) -> Result<Swarm<AuctionNetworkBehaviour>, Box<dyn Error>> {
-    
-    // --- 1. GOSSIPSUB & SCORING ---
+pub fn setup_swarm(
+    id_keys: identity::Keypair,
+    local_peer_id: PeerId,
+) -> Result<libp2p::Swarm<AuctionNetworkBehaviour>, Box<dyn std::error::Error>> {
+
+    let message_id_fn = |message: &gossipsub::Message| {
+        let mut s = DefaultHasher::new();
+        message.data.hash(&mut s);
+        gossipsub::MessageId::from(s.finish().to_string())
+    };
+
     let gossipsub_config = gossipsub::ConfigBuilder::default()
         .heartbeat_interval(Duration::from_secs(1))
         .validation_mode(gossipsub::ValidationMode::Strict)
-        .max_transmit_size(2048) 
-        .mesh_n_low(3)   
-        .mesh_n(4)       
-        .mesh_n_high(5)  
+        .message_id_fn(message_id_fn)
         .build()
         .expect("Valid gossipsub config");
 
-    let mut gossipsub_behaviour = gossipsub::Behaviour::new(
+    let mut gossipsub = gossipsub::Behaviour::new(
         gossipsub::MessageAuthenticity::Signed(id_keys.clone()),
         gossipsub_config,
-    ).expect("Valid gossipsub behaviour");
-
-    let thresholds = PeerScoreThresholds {
-        gossip_threshold: -10.0,
-        publish_threshold: -50.0,
-        graylist_threshold: -80.0,
-        accept_px_threshold: 10.0,
-        opportunistic_graft_threshold: 20.0,
-    };
-
-    let score_params = PeerScoreParams::default();
-    let _ = gossipsub_behaviour.with_peer_score(score_params, thresholds);
+    )
+    .expect("Valid gossipsub behaviour");
 
     let topic = gossipsub::IdentTopic::new("energy-auction");
-    gossipsub_behaviour.subscribe(&topic)?;
+    gossipsub.subscribe(&topic)?;
 
-    // --- 2. KADEMLIA DHT ---
-    let store = MemoryStore::new(local_peer_id);
-    let kad_config = kad::Config::new(libp2p::StreamProtocol::new("/energy-auction/kad/1.0.0"));
-    let kademlia_behaviour = kad::Behaviour::with_config(local_peer_id, store, kad_config);
-
-    // --- 3. IDENTIFY PROTOCOL (NAT/Port Discovery) ---
-    let identify_config = identify::Config::new(
-        "/energy-auction/id/1.0.0".to_string(),
+   // FIX: Removed the unstable push_listen_addr_updates flag which was causing the UNEXPECTED_MESSAGE crash during circuit dialing.
+    let identify = identify::Behaviour::new(identify::Config::new(
+        "/energy-auction/1.0.0".into(),
         id_keys.public(),
-    )
-    .with_push_listen_addr_updates(true); 
-    let identify_behaviour = identify::Behaviour::new(identify_config);
+    ));
+    let (relay_transport, relay_client) = relay::client::new(local_peer_id);
 
-    // --- 4. COMBINE BEHAVIOURS ---
-    let behaviour = AuctionNetworkBehaviour { 
-        gossipsub: gossipsub_behaviour,
-        kademlia: kademlia_behaviour,
-        identify: identify_behaviour,
-    };
-
-    let swarm = SwarmBuilder::with_existing_identity(id_keys)
+    let swarm = SwarmBuilder::with_existing_identity(id_keys.clone())
         .with_tokio()
-        .with_tcp(tcp::Config::default(), noise::Config::new, yamux::Config::default)?
-        .with_behaviour(|_| behaviour)?
-        .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(60)))
+        .with_tcp(
+            tcp::Config::default().port_reuse(true),
+            noise::Config::new,
+            yamux::Config::default,
+        )?
+        .with_other_transport(|key| {
+            relay_transport
+                .upgrade(upgrade::Version::V1)
+                .authenticate(noise::Config::new(key).unwrap())
+                .multiplex(yamux::Config::default())
+                .boxed()
+        })?
+        .with_behaviour(|_| AuctionNetworkBehaviour {
+            gossipsub,
+            identify,
+            relay_client,
+            dcutr: dcutr::Behaviour::new(local_peer_id),
+            autonat: autonat::Behaviour::new(local_peer_id, autonat::Config::default()),
+            ping: ping::Behaviour::new(ping::Config::new()),
+        })?
+        // Increased from 60s to 300s — the relay connection must stay alive
+        // through the full reservation handshake + identify exchange.
+        .with_swarm_config(|c: libp2p::swarm::Config| {
+            c.with_idle_connection_timeout(Duration::from_secs(300))
+        })
         .build();
 
     Ok(swarm)

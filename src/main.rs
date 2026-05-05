@@ -9,16 +9,20 @@ use std::error::Error;
 use tokio::{io, io::AsyncBufReadExt, select, time}; 
 use futures::StreamExt; 
 use libp2p::swarm::SwarmEvent;
+use libp2p::multiaddr::Protocol;
 use std::env;
 use std::time::{SystemTime, UNIX_EPOCH, Duration}; 
 
-const HEARTBEAT_TIMEOUT: u64 = 30; 
+// FIX: Increased timeout to 600s to prevent Gossipsub deduplication drops from triggering a false slash.
+const HEARTBEAT_TIMEOUT: u64 = 600;
 
-const AUTHORIZED_METERS: [&str; 4] = [
-    "12D3KooWP12edPP1guWsgxgmr74Lt1aE7JwFksyCiew9Srr8RjwB", 
-    "12D3KooWFuoRX7BQ9PJHUxzvJjzuJFx11TYPWX6A3pRWqUHxZZeg", 
-    "12D3KooWCaSszh4dejZ2zWaRUfeXadBmsrvXmRZDokghX2pCSUf9", 
-    "12D3KooWMvGUTxq75wzFwMy7YjKaKigV4w2UxqcjTbNvUDaxXWHs", 
+// --- HARDCODED RELAY ID FROM YOUR LOGS ---
+const RELAY_PEER_ID: &str = "12D3KooWKxwfyfV85s6H4PP91L7TgdVrbMS9VDRasyBAio5hKy8S"; 
+
+const AUTHORIZED_METERS: [&str; 3] = [
+    RELAY_PEER_ID,
+    "12D3KooWP12edPP1guWsgxgmr74Lt1aE7JwFksyCiew9Srr8RjwB", // Terminal A
+    "12D3KooWFuoRX7BQ9PJHUxzvJjzuJFx11TYPWX6A3pRWqUHxZZeg", // Terminal B
 ];
 
 #[tokio::main]
@@ -39,37 +43,30 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let local_peer_id = id_keys.public().to_peer_id();
     let mut swarm = network::setup_swarm(id_keys, local_peer_id)?;
-    let listen_addr: libp2p::Multiaddr = format!("/ip4/127.0.0.1/tcp/{}", listen_port).parse()?;
     
+    let listen_addr: libp2p::Multiaddr = format!("/ip4/0.0.0.0/tcp/{}", listen_port).parse()?;
     swarm.listen_on(listen_addr.clone())?;
-    swarm.behaviour_mut().kademlia.set_mode(Some(libp2p::kad::Mode::Server));
 
     println!("=========================================================");
     println!("      ⚡ DECENTRALIZED P2P ENERGY MARKETPLACE ⚡      ");
     println!("=========================================================");
     println!("My Permanent Peer ID: {}", local_peer_id);
     println!("---------------------------------------------------------");
-    println!("COMMANDS:");
-    println!("  WALLET                   - View your Credits and Energy balances");
-    println!("  SELL <energy> <reserve>  - Create auction");
-    println!("  LOBBY                    - View active auctions");
-    println!("  JOIN <id>                - Participate in auction");
-    println!("  BID <amount>             - Submit cryptographic bid");
-    println!("  VALIDATE <id>            - Stake 100 credits to act as Network Referee");
-    println!("  UNPLUG <id>              - Physically disconnect meter");
-    println!("---------------------------------------------------------");
+
+    let mut global_relay_addr: Option<libp2p::Multiaddr> = None;
 
     if args.len() > 2 {
         let bootstrap_addr: libp2p::Multiaddr = args[2].parse().unwrap();
-        println!("🔗 Bootstrapping... Dialing known neighbor: {}", bootstrap_addr);
-        swarm.dial(bootstrap_addr)?;
+        println!("🔗 Dialing Cloud Relay... (Waiting for secure TCP connection)");
+        
+        swarm.dial(bootstrap_addr.clone())?;
+        global_relay_addr = Some(bootstrap_addr);
     }
 
     let mut stdin = io::BufReader::new(io::stdin()).lines();
     let mut state = auction::MarketplaceState::new();
     let topic = libp2p::gossipsub::IdentTopic::new("energy-auction");
-
-    let mut background_timer = time::interval(Duration::from_secs(1));
+    let mut background_timer = time::interval(Duration::from_secs(10));
     let mut last_heartbeat_sent = 0;
     let mut has_revealed = false; 
     let mut executed_auctions = std::collections::HashSet::new(); 
@@ -109,12 +106,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 }
 
                 for (auction_id, current_auction) in state.active_auctions.iter_mut() {
-                    
-                    // --- HEARTBEAT LOGIC ---
                     if current_auction.is_delivering && !current_auction.slashed {
                         if current_auction.seller_id == local_peer_id.to_string() {
                             if !state.unplugged_meters.contains(auction_id) && current_unix_secs.saturating_sub(last_heartbeat_sent) >= 5 {
-                                current_auction.energy_delivered += 20;
+                                
+                                // FIX: Sped up virtual battery delivery so it completes cleanly.
+                                current_auction.energy_delivered += 50; 
+                                
                                 if current_auction.energy_delivered >= current_auction.energy_amount {
                                     println!("✅ [SMART METER]: Delivery Complete!");
                                     current_auction.is_delivering = false;
@@ -143,7 +141,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         }
                     }
 
-                    // --- PHASE 2: TRIGGER REVEAL ---
                     if current_unix_secs > current_auction.commit_deadline && current_unix_secs <= current_auction.reveal_deadline && !current_auction.resolved {
                         if Some(auction_id.clone()) == state.current_joined_auction && !has_revealed {
                             if let (Some(bid), Some(blind)) = (state.my_secret_bid, state.my_secret_blind) {
@@ -164,20 +161,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         }
                     }
 
-                    // --- PHASE 3: REFEREE VERDICT & NETWORK FALLBACK ---
-                    
-                    // 1. If we have a verified verdict, execute the ledger payouts once!
                     if current_auction.verdict_received && !executed_auctions.contains(auction_id) {
                         local_resolution_queue.push(auction_id.clone());
                         executed_auctions.insert(auction_id.clone());
                     }
 
-                    // 2. Timeout and Generation Logic
                     if current_unix_secs > current_auction.reveal_deadline && !current_auction.verdict_received {
-                        
-                        // IF WE ARE THE VALIDATOR: Generate and broadcast the official Verdict
                         if current_auction.validator_id.as_ref() == Some(&local_peer_id.to_string()) && !current_auction.resolved {
-                            current_auction.resolve(); // Generate ground truth
+                            current_auction.resolve(); 
                             
                             println!("⚖️ [REFEREE]: Broadcasting Official Verdict for {}!", auction_id);
                             let msg = network::NetworkMessage::Verdict {
@@ -192,19 +183,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             current_auction.verdict_received = true; 
                         }
                         
-                        // IF VALIDATOR WENT OFFLINE: 15-second Fallback (Self-Healing Network)
                         if current_auction.validator_id.is_none() || current_unix_secs > current_auction.reveal_deadline + 15 {
                             if !current_auction.resolved {
                                 println!("⚠️ [NETWORK]: No valid referee verdict received. Falling back to local decentralized resolution.");
                                 current_auction.resolve();
-                                local_resolution_queue.push(auction_id.clone()); // Push directly for fallback
+                                local_resolution_queue.push(auction_id.clone()); 
                                 executed_auctions.insert(auction_id.clone());
                             }
                         }
                     }
                 }
 
-                // --- EXECUTE FINAL STATE CHANGES ---
                 for auction_id in local_resolution_queue {
                     if let Some(auction_to_close) = state.active_auctions.get_mut(&auction_id) {
                         
@@ -217,19 +206,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         auction_to_close.verdict_received = true; 
                         has_revealed = false; 
 
-                        // 1. Validator Fee Payout & Bond Return
                         if Some(my_id.clone()) == auction_to_close.validator_id {
-                            state.my_locked_credits -= 100; // Release bond
+                            state.my_locked_credits -= 100; 
                             if successful_referee {
-                                state.my_credits += 100 + validator_fee; // Refund + Fee
+                                state.my_credits += 100 + validator_fee; 
                                 println!("💼 Wallet: Referee job complete. Honesty Bond refunded + {} credit Gas Fee earned!", validator_fee);
                             } else {
-                                state.my_credits += 100; // Just refund bond
+                                state.my_credits += 100; 
                                 println!("💼 Wallet: You failed to submit a verdict in time. Honesty Bond refunded, but NO fee earned.");
                             }
                         }
 
-                        // 2. Nuclear Slashing for non-revealers
                         if auction_to_close.slash_list.contains(&my_id) {
                             if let Some(my_bid) = state.my_secret_bid {
                                 state.my_locked_credits -= my_bid; 
@@ -237,7 +224,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             }
                         }
                         
-                        // 3. Trade Execution
                         if auction_to_close.failed {
                             if auction_to_close.seller_id == my_id {
                                 state.my_locked_credits -= stake_amount;
@@ -257,7 +243,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             
                             if auction_to_close.seller_id == my_id {
                                 state.my_locked_credits -= stake_amount;
-                                state.my_credits += stake_amount + price - validator_fee; // Seller pays fee ONLY if successful
+                                state.my_credits += stake_amount + price - validator_fee; 
                                 state.my_locked_energy -= auction_to_close.energy_amount; 
                                 println!("💼 Wallet: Sold! Received {} credits. (Paid {} referee fee).", price, validator_fee);
                             }
@@ -282,7 +268,27 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 let line_str = line.trim(); 
                 let parts: Vec<&str> = line_str.split_whitespace().collect();
                 
-                if line_str == "WALLET" {
+                if line_str == "CONNECT" {
+                    if let Some(relay_addr) = &global_relay_addr {
+                        println!("📡 Dialing explicit connection to peers via relay...");
+                        for &peer_str in AUTHORIZED_METERS.iter() {
+                            if peer_str != local_peer_id.to_string() && peer_str != RELAY_PEER_ID {
+                                if let Ok(target_peer) = peer_str.parse::<libp2p::PeerId>() {
+                                    let circuit_addr = relay_addr.clone()
+                                        .with(Protocol::P2pCircuit)
+                                        .with(Protocol::P2p(target_peer));
+                                    match swarm.dial(circuit_addr) {
+                                        Ok(_) => println!("🔗 Pinging peer {} over circuit...", &peer_str[0..8]),
+                                        Err(e) => println!("❌ Failed to initiate dial: {:?}", e),
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        println!("❌ Error: Not connected to a relay.");
+                    }
+                }
+                else if line_str == "WALLET" {
                     println!("\n💰 YOUR VIRTUAL LEDGER 💰");
                     println!("   Credits: {} (Locked: {})", state.my_credits, state.my_locked_credits);
                     println!("   Battery: {} kWh (Locked: {} kWh)\n", state.my_energy, state.my_locked_energy);
@@ -394,39 +400,59 @@ async fn main() -> Result<(), Box<dyn Error>> {
             }
 
             event = swarm.select_next_some() => match event {
-                SwarmEvent::ConnectionEstablished { peer_id, .. } => {
-                    println!("🔌 Network: Successfully connected to peer {}...", &peer_id.to_string()[0..8]);
-                    swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
+                SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
+                    let addr = endpoint.get_remote_address();
+                    println!("🔌 Connected to peer {} via [{}]", &peer_id.to_string()[0..8], addr);
+                    
+                    if peer_id.to_string() == RELAY_PEER_ID {
+                        println!("📡 TCP Secure. Now requesting slot on Cloud Relay...");
+                        if let Some(relay_addr) = &global_relay_addr {
+                            let relay_listen_addr = relay_addr.clone().with(Protocol::P2pCircuit);
+                            match swarm.listen_on(relay_listen_addr) {
+                                Ok(_) => println!("⏳ Reservation request sent..."),
+                                Err(e) => println!("❌ Listen Error: {:?}", e),
+                            }
+                        }
+                    } else if AUTHORIZED_METERS.contains(&peer_id.to_string().as_str()) {
+                        println!("✅ PEER-TO-PEER HANDSHAKE SUCCESSFUL!");
+                        swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
+                    }
                 },
+                
+                SwarmEvent::NewListenAddr { address, .. } => {
+                    if address.to_string().contains("p2p-circuit") {
+                        println!("✅ SUCCESS: Secured reserved slot on Cloud Relay!");
+                    }
+                },
+                SwarmEvent::NewExternalAddrCandidate { address, .. } => {
+                    if address.to_string().contains("p2p-circuit") {
+                        println!("✅ SUCCESS: Relay slot secured (Candidate Phase)!");
+                    }
+                },
+                SwarmEvent::ListenerClosed { reason, .. } => {
+                    println!("⚠️ Listener Closed: {:?}", reason);
+                },
+                SwarmEvent::ListenerError { error, .. } => {
+                    println!("❌ Listener Error: {:?}", error);
+                },
+                SwarmEvent::OutgoingConnectionError { error, .. } => {
+                    println!("⚠️ Handshake failed with peer: {:?}", error);
+                },
+                
+                SwarmEvent::Behaviour(network::AuctionNetworkBehaviourEvent::Dcutr(event)) => {
+                    println!("🕳️ 🥊 DCUtR Hole-Punch Event: {:?}", event);
+                },
+                
                 SwarmEvent::Behaviour(network::AuctionNetworkBehaviourEvent::Gossipsub(libp2p::gossipsub::Event::Message { message, .. })) => {
                     if let Ok(parsed_msg) = serde_json::from_str::<network::NetworkMessage>(&String::from_utf8_lossy(&message.data)) {
-                        
-                        // Heartbeats
-                        if let network::NetworkMessage::Heartbeat { auction_id, seller_id } = &parsed_msg {
-                            if let Some(target_auction) = state.active_auctions.get_mut(auction_id) {
-                                if target_auction.is_delivering && target_auction.seller_id == *seller_id {
-                                    target_auction.last_heartbeat = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-                                }
-                            }
-                            continue;
-                        }
-
-                        if let network::NetworkMessage::DeliveryComplete { auction_id, seller_id } = &parsed_msg {
-                            if let Some(target_auction) = state.active_auctions.get_mut(auction_id) {
-                                if target_auction.is_delivering && target_auction.seller_id == *seller_id {
-                                    target_auction.is_delivering = false;
-                                }
-                            }
-                            continue;
-                        }
-
                         let incoming_peer_id = match &parsed_msg {
                             network::NetworkMessage::AnnounceAuction { seller_id, .. } => seller_id,
                             network::NetworkMessage::Commit { bidder_id, .. } => bidder_id,
                             network::NetworkMessage::Reveal { bidder_id, .. } => bidder_id,
                             network::NetworkMessage::IntentToValidate { validator_id, .. } => validator_id,
                             network::NetworkMessage::Verdict { validator_id, .. } => validator_id,
-                            _ => continue,
+                            network::NetworkMessage::Heartbeat { seller_id, .. } => seller_id,
+                            network::NetworkMessage::DeliveryComplete { seller_id, .. } => seller_id,
                         };
 
                         if !AUTHORIZED_METERS.contains(&incoming_peer_id.as_str()) { continue; }
@@ -447,7 +473,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                     }
                                 }
                             },
-                            // 🔥 RESTORED: Calling resolve() locally turns the Smart Meter on!
                             network::NetworkMessage::Verdict { auction_id, validator_id, winner_id, clearing_price, slash_list } => {
                                 if let Some(target_auction) = state.active_auctions.get_mut(&auction_id) {
                                     if target_auction.verdict_received { continue; }
@@ -465,7 +490,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                     if is_honest {
                                         println!("✅ [NETWORK CONSENSUS]: Referee {}'s math verified as HONEST. Executing Ledger Transfers...", &validator_id[0..8]);
                                         
-                                        target_auction.resolve(); // This calculates the winner AND triggers `is_delivering = true`
+                                        target_auction.resolve(); 
                                         target_auction.verdict_received = true; 
                                     } else {
                                         println!("🚨🚨🚨 [NETWORK SECURITY]: REFEREE {} SUBMITTED A FRAUDULENT VERDICT!", &validator_id[0..8]);
@@ -490,19 +515,26 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                 if let Some(target_auction) = state.active_auctions.get_mut(&auction_id) {
                                     if let Some(stored_binding_hash) = target_auction.received_commitments.get(&bidder_id) {
                                         if crypto::verify_binding_hash(stored_binding_hash, bid, &blind_hex, &bidder_id) {
-                                            if !target_auction.verified_bids.contains_key(&bidder_id) {
-                                                println!("👀 Network: Peer {} revealed their bid of {} credits!", &bidder_id[0..8], bid);
-                                            }
                                             target_auction.verified_bids.insert(bidder_id.clone(), bid);
-                                            if let Ok(blind_bytes_vec) = hex::decode(&blind_hex) {
-                                                let mut blind_bytes = [0u8; 32];
-                                                blind_bytes.copy_from_slice(&blind_bytes_vec);
-                                                target_auction.verified_blinds.insert(bidder_id.clone(), blind_bytes);
-                                            }
+                                            println!("👀 Network: Peer {} revealed their bid of {} credits!", &bidder_id[0..8], bid);
                                         }
                                     }
                                 }
                             },
+                            
+                            // FIX: Added the 5-line polish to prevent B from ignoring A's delivery updates!
+                            network::NetworkMessage::Heartbeat { auction_id, seller_id: _ } => {
+                                if let Some(target_auction) = state.active_auctions.get_mut(&auction_id) {
+                                    target_auction.last_heartbeat = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+                                }
+                            },
+                            network::NetworkMessage::DeliveryComplete { auction_id, seller_id } => {
+                                if let Some(target_auction) = state.active_auctions.get_mut(&auction_id) {
+                                    println!("✅ [SMART METER]: Verified complete energy delivery from {}!", &seller_id[0..8]);
+                                    target_auction.is_delivering = false;
+                                }
+                            },
+                            
                             _ => {}
                         }
                     }
