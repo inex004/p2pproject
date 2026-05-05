@@ -15,9 +15,7 @@ path = "src/main.rs"
 # 2. The Original Attack Script
 [[bin]]
 name = "evil_node"
-path = "src/bin/evil_node.rs" # FIX: Added /bin/
-
-
+path = "src/bin/evil_node.rs" 
 
 [dependencies]
 curve25519-dalek = { version = "4.1", features = ["rand_core", "digest"] }
@@ -26,6 +24,9 @@ sha2 = "0.10"
 hex = "0.4"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
-libp2p = { version = "0.53", features = ["tokio", "noise", "yamux", "tcp", "gossipsub", "kad", "macros", "identify", "relay", "autonat", "dcutr", "ping"] }
+
+# 🔥 FIX: Removed WebRTC. Added "upnp" for stable NAT traversal.
+libp2p = { version = "0.53", features = ["macros", "tokio", "tcp", "quic", "noise", "yamux", "gossipsub", "kad", "relay", "identify", "autonat", "dcutr", "ping", "upnp"] }
+
 tokio = { version = "1.50.0", features = ["full"] }
 futures = "0.3.32"

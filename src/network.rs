@@ -1,5 +1,6 @@
 use libp2p::{
-    gossipsub, identify, identity, noise, tcp, yamux, relay, autonat, dcutr, ping,
+    gossipsub, identify, identity, noise, yamux, relay, autonat, dcutr, ping, 
+    kad, kad::store::MemoryStore, upnp, // 🔥 NEW: Imported upnp
     swarm::NetworkBehaviour,
     PeerId, SwarmBuilder, Transport,
 };
@@ -28,6 +29,8 @@ pub struct AuctionNetworkBehaviour {
     pub dcutr: dcutr::Behaviour,
     pub autonat: autonat::Behaviour,
     pub ping: ping::Behaviour,
+    pub kad: kad::Behaviour<MemoryStore>, 
+    pub upnp: upnp::tokio::Behaviour, // 🔥 NEW: Added UPnP Network Behaviour
 }
 
 pub fn setup_swarm(
@@ -51,26 +54,22 @@ pub fn setup_swarm(
     let mut gossipsub = gossipsub::Behaviour::new(
         gossipsub::MessageAuthenticity::Signed(id_keys.clone()),
         gossipsub_config,
-    )
-    .expect("Valid gossipsub behaviour");
+    ).expect("Valid gossipsub behaviour");
 
     let topic = gossipsub::IdentTopic::new("energy-auction");
     gossipsub.subscribe(&topic)?;
 
-   // FIX: Removed the unstable push_listen_addr_updates flag which was causing the UNEXPECTED_MESSAGE crash during circuit dialing.
-    let identify = identify::Behaviour::new(identify::Config::new(
-        "/energy-auction/1.0.0".into(),
-        id_keys.public(),
-    ));
+    let identify = identify::Behaviour::new(identify::Config::new("/energy-auction/1.0.0".into(), id_keys.public()));
+    
     let (relay_transport, relay_client) = relay::client::new(local_peer_id);
+
+    let store = MemoryStore::new(local_peer_id);
+    let mut kademlia = kad::Behaviour::new(local_peer_id, store);
+    kademlia.set_mode(Some(kad::Mode::Client));
 
     let swarm = SwarmBuilder::with_existing_identity(id_keys.clone())
         .with_tokio()
-        .with_tcp(
-            tcp::Config::default().port_reuse(true),
-            noise::Config::new,
-            yamux::Config::default,
-        )?
+        .with_quic() 
         .with_other_transport(|key| {
             relay_transport
                 .upgrade(upgrade::Version::V1)
@@ -85,12 +84,10 @@ pub fn setup_swarm(
             dcutr: dcutr::Behaviour::new(local_peer_id),
             autonat: autonat::Behaviour::new(local_peer_id, autonat::Config::default()),
             ping: ping::Behaviour::new(ping::Config::new()),
+            kad: kademlia, 
+            upnp: upnp::tokio::Behaviour::default(), // 🔥 NEW: Initialize UPnP mapping
         })?
-        // Increased from 60s to 300s — the relay connection must stay alive
-        // through the full reservation handshake + identify exchange.
-        .with_swarm_config(|c: libp2p::swarm::Config| {
-            c.with_idle_connection_timeout(Duration::from_secs(300))
-        })
+        .with_swarm_config(|c: libp2p::swarm::Config| c.with_idle_connection_timeout(Duration::from_secs(300)))
         .build();
 
     Ok(swarm)
