@@ -19,6 +19,9 @@ pub enum NetworkMessage {
     Reveal { auction_id: String, bidder_id: String, bid: u64, blind_hex: String },
     Heartbeat { auction_id: String, seller_id: String },
     DeliveryComplete { auction_id: String, seller_id: String },
+    
+    // 🔥 NEW: The Signaling Message for our custom hole puncher
+    NatSignal { peer_id: String, public_ip: String },
 }
 
 #[derive(NetworkBehaviour)]

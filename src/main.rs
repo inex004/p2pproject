@@ -1,6 +1,8 @@
 mod crypto;
 mod network;
 mod auction;
+mod hole_punch; // 🔥 NEW: Import our raw UDP sprayer
+mod magicsock;  // 🔥 NEW: Import the MagicSocket
 
 use std::fs;
 use std::collections::HashSet;
@@ -35,10 +37,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
     };
 
     let local_peer_id = id_keys.public().to_peer_id();
+    
+    // 🔥 NEW: Initialize the MagicSocket! (Using listen_port + 100)
+    let mut magic_sock = magicsock::MagicSocket::new(listen_port + 100, id_keys.clone());
+    println!("🪄 MagicSocket bound and roaming enabled on port {}", listen_port + 100);
+
     let mut swarm = network::setup_swarm(id_keys, local_peer_id)?;
     
     let listen_addr: libp2p::Multiaddr = format!("/ip4/0.0.0.0/udp/{}/quic-v1", listen_port).parse()?;
     swarm.listen_on(listen_addr.clone())?;
+
+    // 🔥 NEW: Enable Dual-Stack IPv6 Listening!
+    swarm.listen_on(format!("/ip6/::/udp/{}/quic-v1", listen_port).parse()?)?;
 
     println!("=========================================================");
     println!("      ⚡ DECENTRALIZED P2P ENERGY MARKETPLACE ⚡      ");
@@ -67,11 +77,35 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut known_peers = HashSet::new();
     let room_key = RecordKey::new(&"energy-auction");
 
+    // 🔥 NEW: State tracking for our raw UDP sprayer
+    let mut my_public_ip: Option<String> = None;
+    let mut sprayed_peers = HashSet::new(); 
+    
+    // 🔥 NEW: A fast timer to poll the MagicSocket for incoming direct data
+    let mut magicsock_timer = time::interval(Duration::from_millis(50));
+    
     loop {
         select! {
+            // 🔥 NEW: Catch incoming direct UDP packets that bypassed the Relay!
+            _ = magicsock_timer.tick() => {
+                while let Some((sender_peer, payload)) = magic_sock.poll_incoming() {
+                    let message = String::from_utf8_lossy(&payload);
+                    println!("⚡ [MAGICSOCK DIRECT]: Verified packet from {} -> {}", 
+                             &sender_peer.to_string()[0..8], message);
+                }
+            }
+
             _ = background_timer.tick() => {
                 let current_unix_secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
                 let mut local_resolution_queue = Vec::new();
+                // 🔥 FIX: Periodically broadcast our Public IP so newly joined peers can hear it!
+                if let Some(ip_str) = &my_public_ip {
+                    let msg = network::NetworkMessage::NatSignal {
+                        peer_id: local_peer_id.to_string(),
+                        public_ip: ip_str.clone(),
+                    };
+                    let _ = swarm.behaviour_mut().gossipsub.publish(topic.clone(), serde_json::to_string(&msg).unwrap().as_bytes());
+                }
 
                 if global_relay_addr.is_some() {
                     let _ = swarm.behaviour_mut().kad.get_providers(room_key.clone());
@@ -207,6 +241,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         }
                         
                         if auction_to_close.failed {
+                            println!("❌ [AUCTION FAILED]: Not enough valid bids. Returning funds and energy.");
                             if auction_to_close.seller_id == my_id {
                                 state.my_locked_credits -= stake_amount;
                                 state.my_credits += stake_amount;
@@ -225,6 +260,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                 state.my_locked_credits -= stake_amount;
                                 state.my_credits += stake_amount + price - validator_fee; 
                                 state.my_locked_energy -= auction_to_close.energy_amount; 
+                                // 🔥 NEW: Tell the seller they got paid!
+                                println!("🎉 [MARKET CLEARED]: Sold {} kWh for {} credits to peer {}!", 
+                                         auction_to_close.energy_amount, price, &winner[0..8]);
                             }
                             
                             if winner == &my_id {
@@ -232,9 +270,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                 state.my_locked_credits -= my_bid;
                                 state.my_credits += my_bid - price; 
                                 state.my_energy += auction_to_close.energy_amount; 
+                                // 🔥 NEW: Tell the buyer they won!
+                                println!("🏆 [VICTORY]: You won the auction! Received {} kWh for {} credits (Refunded {} overbid).", 
+                                         auction_to_close.energy_amount, price, my_bid - price);
                             } else if let Some(my_bid) = auction_to_close.verified_bids.get(&my_id) {
                                 state.my_locked_credits -= my_bid;
                                 state.my_credits += my_bid;
+                                // 🔥 NEW: Tell the loser they got their money back!
+                                println!("⚖️ [OUTBID]: You did not win the auction. Refunded your {} credits.", my_bid);
                             }
                         }
                     }
@@ -338,9 +381,61 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         }
                     }
                 }
+                // 🔥 NEW: Manually inject a route to bypass the Gossipsub paradox!
+                else if line_str.starts_with("ROUTE ") && parts.len() == 3 {
+                    if let (Ok(target_peer), Ok(target_addr)) = (parts[1].parse::<libp2p::identity::PeerId>(), parts[2].parse::<std::net::SocketAddr>()) {
+                        magic_sock.add_peer_route(target_peer, target_addr);
+                        println!("🗺️ [MANUAL ROUTING]: Added {} at {} to Magicsock!", &parts[1][..8], target_addr);
+                    } else {
+                        println!("❌ Invalid format. Use: ROUTE <PEER_ID> <IP:PORT>");
+                    }
+                }
+                // 🔥 NEW: Type "MAGIC <PEER_ID> <MESSAGE>" to fire a direct UDP packet!
+                else if line_str.starts_with("MAGIC ") && parts.len() >= 3 {
+                    if let Ok(target_peer) = parts[1].parse::<libp2p::identity::PeerId>() {
+                        let payload = parts[2..].join(" ").into_bytes();
+                        magic_sock.send_to_peer(&target_peer, payload);
+                        println!("🪄 [MAGICSOCK]: Fired cryptographic packet at {}!", &parts[1][..8]);
+                    } else {
+                        println!("❌ Invalid Peer ID format.");
+                    }
+                }
             }
 
             event = swarm.select_next_some() => match event {
+                // 🔥 FIX: Correctly unpack the Identify Event
+                SwarmEvent::Behaviour(network::AuctionNetworkBehaviourEvent::Identify(libp2p::identify::Event::Received { peer_id: _, info })) => {
+                    if my_public_ip.is_none() {
+                        for protocol in info.observed_addr.iter() {
+                            // 🔥 NEW: Check for IPv6 FIRST! 
+                            if let Protocol::Ip6(ip) = protocol {
+                                let ip_str = ip.to_string();
+                                println!("🌌 [IPV6 SIGNALING]: The Cloud Relay sees our Public IPv6 as: {}", ip_str);
+                                my_public_ip = Some(ip_str.clone());
+                                
+                                let msg = network::NetworkMessage::NatSignal {
+                                    peer_id: local_peer_id.to_string(),
+                                    public_ip: ip_str,
+                                };
+                                let _ = swarm.behaviour_mut().gossipsub.publish(topic.clone(), serde_json::to_string(&msg).unwrap().as_bytes());
+                                break;
+                            } 
+                            // Fallback to IPv4 if IPv6 isn't available
+                            else if let Protocol::Ip4(ip) = protocol {
+                                let ip_str = ip.to_string();
+                                println!("🔍 [IPV4 SIGNALING]: The Cloud Relay sees our Public IPv4 as: {}", ip_str);
+                                my_public_ip = Some(ip_str.clone());
+                                
+                                let msg = network::NetworkMessage::NatSignal {
+                                    peer_id: local_peer_id.to_string(),
+                                    public_ip: ip_str,
+                                };
+                                let _ = swarm.behaviour_mut().gossipsub.publish(topic.clone(), serde_json::to_string(&msg).unwrap().as_bytes());
+                                break;
+                            }
+                        }
+                    }
+                },
                 SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
                     let addr = endpoint.get_remote_address();
                     println!("🔌 [TCP HANDSHAKE]: Connected to peer {} via [{}]", &peer_id.to_string()[0..8], addr);
@@ -373,14 +468,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 },
                 
                 SwarmEvent::Dialing { peer_id, .. } => {
-                    if let Some(peer) = peer_id {
-                        println!("📞 [DIALER]: Swarm is actively attempting to dial {}...", &peer.to_string()[0..8]);
+                    if let Some(_peer) = peer_id {
+                        // Muted to prevent spam!
+                        // println!("📞 [DIALER]: Swarm is actively attempting to dial {}...", &_peer.to_string()[0..8]);
                     }
                 },
 
-                SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
-                    if let Some(peer) = peer_id {
-                        println!("💥 [CONNECTION FAILED]: Could not reach peer {}. Reason: {:?}", &peer.to_string()[0..8], error);
+                SwarmEvent::OutgoingConnectionError { peer_id, error: _error, .. } => {
+                    if let Some(_peer) = peer_id {
+                        // Muted to prevent spam!
+                        // println!("💥 [CONNECTION FAILED]: Could not reach peer {}. Reason: {:?}", &_peer.to_string()[0..8], _error);
                     }
                 },
 
@@ -390,7 +487,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     }
                 },
 
-                // 🔥 NEW: Handle UPnP Events to let you know if Port Forwarding succeeded
                 SwarmEvent::Behaviour(network::AuctionNetworkBehaviourEvent::Upnp(event)) => {
                     match event {
                         libp2p::upnp::Event::NewExternalAddr(addr) => println!("🌐 [UPnP]: Router automatically opened port! Public Address: {}", addr),
@@ -449,6 +545,41 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 SwarmEvent::Behaviour(network::AuctionNetworkBehaviourEvent::Gossipsub(libp2p::gossipsub::Event::Message { message, .. })) => {
                     if let Ok(parsed_msg) = serde_json::from_str::<network::NetworkMessage>(&String::from_utf8_lossy(&message.data)) {
                         match parsed_msg {
+                            network::NetworkMessage::NatSignal { peer_id, public_ip } => {
+                                if peer_id != local_peer_id.to_string() && !sprayed_peers.contains(&peer_id) {
+                                    println!("🎯 [SIGNALING]: Received Public IP ({}) from Peer {}.", public_ip, &peer_id[0..8]);
+                                    sprayed_peers.insert(peer_id.clone());
+
+                                    // If we haven't shared our IP yet, do it now so they can spray back!
+                                    if let Some(my_ip) = &my_public_ip {
+                                        let reply = network::NetworkMessage::NatSignal {
+                                            peer_id: local_peer_id.to_string(),
+                                            public_ip: my_ip.clone(),
+                                        };
+                                        let _ = swarm.behaviour_mut().gossipsub.publish(topic.clone(), serde_json::to_string(&reply).unwrap().as_bytes());
+                                    }
+
+                                    // 🚀 LAUNCH THE SPRAY IN A BACKGROUND THREAD 🚀
+                                    let target_ip = public_ip.clone();
+                                    tokio::task::spawn_blocking(move || {
+                                        // Spray common ephemeral port ranges (e.g., 50000 to 51000)
+                                        if let Some(golden_addr) = hole_punch::execute_port_spray(&target_ip, 50000, 51000) {
+                                            println!("🌟 [SUCCESS]: We have a direct, raw UDP line to {}!", golden_addr);
+                                        }
+                                    });
+
+                                    // 🔥 NEW: Add their IP to our MagicSocket routing table!
+                                    if let (Ok(target_peer), Ok(parsed_ip)) = (peer_id.parse::<libp2p::identity::PeerId>(), public_ip.parse::<std::net::IpAddr>()) {
+                                        // Assume they bound their magicsock to their listen port + 100
+                                        // (For testing, we will assume standard port 8102 if they are Terminal B)
+                                        let assumed_magic_port = if public_ip == my_public_ip.clone().unwrap_or_default() { 8102 } else { 8101 };
+                                        let target_addr = std::net::SocketAddr::new(parsed_ip, assumed_magic_port);
+                                        
+                                        magic_sock.add_peer_route(target_peer, target_addr);
+                                        println!("🗺️ [ROUTING]: Added {} to MagicSocket route table at {}", &peer_id[0..8], target_addr);
+                                    }
+                                }
+                            },
                             network::NetworkMessage::AnnounceAuction { auction_id, seller_id, energy_amount, reserve_price } => {
                                 if !state.active_auctions.contains_key(&auction_id) {
                                     println!("📢 NEW MARKET: {}... selling {} kWh (Reserve: {}, ID: {})", &seller_id[0..8], energy_amount, reserve_price, auction_id);
@@ -487,6 +618,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                             println!("👀 Network: Peer {} revealed their bid of {} credits!", &bidder_id[0..8], bid);
                                         }
                                     }
+                                }
+                            },
+                            // 🔥 NEW: Catch the Smart Meter Heartbeats!
+                            network::NetworkMessage::Heartbeat { auction_id, .. } => {
+                                if let Some(target_auction) = state.active_auctions.get_mut(&auction_id) {
+                                    // Reset the 10-minute death timer every time a heartbeat arrives
+                                    target_auction.last_heartbeat = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+                                }
+                            },
+                            // 🔥 NEW: Catch the Delivery Complete signal so we can close the contract
+                            network::NetworkMessage::DeliveryComplete { auction_id, .. } => {
+                                if let Some(target_auction) = state.active_auctions.get_mut(&auction_id) {
+                                    target_auction.is_delivering = false;
+                                    println!("🔌 [SMART METER]: Peer confirmed energy delivery for {} is complete!", auction_id);
                                 }
                             },
                             _ => {}
